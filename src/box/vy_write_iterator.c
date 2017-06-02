@@ -74,6 +74,12 @@ struct vy_write_src {
 	};
 };
 
+struct vy_read_view_stmt {
+	struct tuple *stmt;
+	bool is_tuple_refable;
+	int64_t vlsn;
+};
+
 /**
  * Write iterator itself.
  */
@@ -100,12 +106,30 @@ struct vy_write_iterator {
 	struct tuple_format *format;
 	/** Same as format, but for UPSERT tuples. */
 	struct tuple_format *upsert_format;
-	/* The minimal VLSN among all active transactions */
-	int64_t oldest_vlsn;
 	/* There are is no level older than the one we're writing to. */
 	bool is_last_level;
 	/** Set if this iterator is for a primary index. */
 	bool is_primary;
+
+	/** Length of the @read_views. */
+	int rv_count;
+	/**
+	 * Count of not empty read view statements in @read_views,
+	 * started from stmt_i.
+	 */
+	int stmt_count;
+	/** Current read view statement in @read_views. */
+	int stmt_i;
+	/**
+	 * Read views of the same key, sorted by lsn in
+	 * descending order and started from the INT64_MAX. Each
+	 * is referenced if needed. Example:
+	 * stmt_count = 3
+	 * rv_count = 6
+	 *    0      1      2     3     4     5
+	 * [lsn=6, lsn=5, lsn=4, null, null, null]
+	 */
+	struct vy_read_view_stmt read_views[0];
 };
 
 /**
@@ -233,14 +257,29 @@ static const struct vy_stmt_stream_iface vy_slice_stream_iface;
 struct vy_stmt_stream *
 vy_write_iterator_new(const struct key_def *key_def, struct tuple_format *format,
 		      struct tuple_format *upsert_format, bool is_primary,
-		      bool is_last_level, int64_t oldest_vlsn)
+		      bool is_last_level, struct rlist *read_views)
 {
+	int count = 1; /* One for the INT64_MAX. */
+	struct rlist *unused;
+	rlist_foreach(unused, read_views)
+		++count;
+	size_t size = sizeof(struct vy_write_iterator) +
+		      count * sizeof(struct vy_read_view_stmt);
 	struct vy_write_iterator *stream =
-		(struct vy_write_iterator *) malloc(sizeof(*stream));
+		(struct vy_write_iterator *) calloc(1, size);
 	if (stream == NULL) {
-		diag_set(OutOfMemory, sizeof(*stream), "malloc", "write stream");
+		diag_set(OutOfMemory, size, "malloc", "write stream");
 		return NULL;
 	}
+	stream->rv_count = count;
+	stream->read_views[0].vlsn = INT64_MAX;
+	count--;
+	struct vy_read_view *rv;
+	/* Descending order. */
+	rlist_foreach_entry(rv, read_views, in_read_views)
+		stream->read_views[count--].vlsn = rv->vlsn;
+	assert(count == 0);
+
 	stream->base.iface = &vy_slice_stream_iface;
 	src_heap_create(&stream->src_heap);
 	rlist_create(&stream->src_list);
@@ -250,10 +289,7 @@ vy_write_iterator_new(const struct key_def *key_def, struct tuple_format *format
 	stream->upsert_format = upsert_format;
 	tuple_format_ref(stream->upsert_format, 1);
 	stream->is_primary = is_primary;
-	stream->oldest_vlsn = oldest_vlsn;
 	stream->is_last_level = is_last_level;
-	stream->tuple = NULL;
-	stream->is_tuple_refable = false;
 	return &stream->base;
 }
 
@@ -323,6 +359,11 @@ vy_write_iterator_close(struct vy_stmt_stream *vstream)
 	assert(vstream->iface->close == vy_write_iterator_close);
 	struct vy_write_iterator *stream = (struct vy_write_iterator *)vstream;
 	vy_write_iterator_stop(vstream);
+	for (int i = 0; i < stream->stmt_count; ++i) {
+		struct vy_read_view_stmt *rv = &stream->read_views[i];
+		if (rv->is_tuple_refable && rv->stmt != NULL)
+			tuple_unref(rv->stmt);
+	}
 	tuple_format_ref(stream->format, -1);
 	tuple_format_ref(stream->upsert_format, -1);
 	free(stream);
@@ -404,12 +445,78 @@ vy_write_iterator_merge_step(struct vy_write_iterator *stream)
 }
 
 /**
- * Squash in the single statement all rest statements of current key
- * starting from the current statement.
+ * Get VLSN by the number in the write_iterator.read_views array.
+ * If the number is too big, then the 0 is returned as the oldest
+ * of possible vlsns.
+ *
+ * @param stream Write iterator.
+ * @param n VLSN number to get.
+ *
+ * @retval VLSN.
+ */
+static inline int64_t
+vy_get_read_view_lsn(const struct vy_write_iterator *stream, int n)
+{
+	if (n >= stream->rv_count)
+		return 0;
+	return stream->read_views[n].vlsn;
+}
+
+/**
+ * Remember the current stream->tuple as the read view of the key.
+ * @param stream Write iterator.
+ */
+static inline void
+vy_write_iterator_add_read_view_stmt(struct vy_write_iterator *stream)
+{
+	struct vy_read_view_stmt *rv = &stream->read_views[stream->stmt_count];
+	rv->stmt = stream->tuple;
+	rv->is_tuple_refable = stream->is_tuple_refable;
+	if (stream->is_tuple_refable)
+		tuple_ref(stream->tuple);
+	stream->stmt_count++;
+}
+
+/**
+ * Return the next statement from the current key read view
+ * statements sequence. Unref the previous statement, if needed.
+ * We can't unref the statement right before returning it to the
+ * caller, because reference in the read_views array can be
+ * single reference of this statement, and unref could delete it
+ * before returning.
+ *
+ * @param stream Write iterator.
+ * @retval not NULL Next statement of the current key.
+ * @retval     NULL End of the key (not the end of the sources).
+ */
+static inline struct tuple *
+vy_write_iterator_pop_read_view_stmt(struct vy_write_iterator *stream)
+{
+	struct vy_read_view_stmt *rv;
+	if (stream->stmt_i > 0) {
+		/* Unref the previous. */
+		rv = &stream->read_views[stream->stmt_i - 1];
+		if (rv->is_tuple_refable && rv->stmt != NULL)
+			tuple_unref(rv->stmt);
+		rv->stmt = NULL;
+	}
+	if (stream->stmt_i == stream->stmt_count)
+		return NULL;
+	assert(stream->stmt_i < stream->stmt_count);
+	rv = &stream->read_views[stream->stmt_i];
+	stream->stmt_i++;
+	return rv->stmt;
+}
+
+/**
+ * Split the next key in the sequence of the read view statements.
+ * @sa struct vy_write_iterator comment for details.
  */
 static NODISCARD int
 vy_write_iterator_next_key(struct vy_write_iterator *stream)
 {
+	assert(stream->stmt_count == 0);
+	assert(stream->stmt_i == 0);
 	assert(stream->tuple != NULL);
 	/*
 	 * A virtual source instance that represents the end on current key in
@@ -422,12 +529,27 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream)
 	struct vy_write_src end_of_key_src;
 	end_of_key_src.is_end_of_key = true;
 	end_of_key_src.tuple = stream->tuple;
+	end_of_key_src.is_tuple_refable = stream->is_tuple_refable;
 	int rc = src_heap_insert(&stream->src_heap, &end_of_key_src.heap_node);
 	if (rc) {
 		diag_set(OutOfMemory, sizeof(void *),
 			 "malloc", "write stream heap");
 		return rc;
 	}
+	/*
+	 * Ref after error checking to avoid unref in a case of
+	 * error.
+	 */
+	if (end_of_key_src.is_tuple_refable)
+		tuple_ref(end_of_key_src.tuple);
+	/* Current position in the read_views array. */
+	int curr_rv_i = 0;
+	/*
+	 * On each step merge statements between merge_until_lsn
+	 * and curr_rv_lsn. (merge_until_lsn <= curr_rv_lsn).
+	 */
+	int64_t curr_rv_lsn = vy_get_read_view_lsn(stream, 0);
+	int64_t merge_until_lsn = vy_get_read_view_lsn(stream, 1);
 
 	while (true) {
 		struct heap_node *node = src_heap_top(&stream->src_heap);
@@ -436,6 +558,68 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream)
 			container_of(node, struct vy_write_src, heap_node);
 		assert(src->tuple != NULL); /* Is search started? */
 
+		/*
+		 * --------------- Optimization 1 ----------------
+		 * About skipping last level DELETE.
+		 *
+		 * Here all statements older than the oldest
+		 * DELETE are skipped. There is no necessity to
+		 * process them.
+		 * Else check, if the optimization is applicable.
+		 */
+		if (vy_stmt_lsn(src->tuple) > curr_rv_lsn) {
+			assert(src->is_end_of_key || curr_rv_lsn == 0);
+			goto next_step;
+		}
+		if (vy_stmt_type(src->tuple) == IPROTO_DELETE &&
+		    stream->is_last_level && merge_until_lsn == 0) {
+			/*
+			 * merge_until_lsn must be 0, because
+			 * the last level DELETE can not skip
+			 * older statements, if there is older
+			 * read views.
+			 */
+			curr_rv_lsn = 0;
+			if (src->is_end_of_key)
+				break;
+			goto next_step;
+		}
+
+		/*
+		 * --------------- Optimization 2 ----------------
+		 * About ignoring the statements with the column
+		 * mask not intersected with the key mask.
+		 */
+		if ((vy_stmt_type(src->tuple) == IPROTO_REPLACE ||
+		     vy_stmt_type(src->tuple) == IPROTO_DELETE) &&
+		    !stream->is_primary &&
+		    vy_can_skip_update(stream->key_def->column_mask,
+				       vy_stmt_column_mask(src->tuple))) {
+			if (src->is_end_of_key)
+				break;
+			goto next_step;
+		}
+
+		/*
+		 * The current LSNs subsequence is finished, if
+		 * the statement LSN is behind the range
+		 * (merge_until_lsn, curr_range_lsn]. In such a
+		 * case save the current version of the key
+		 * for the current vlsn.
+		 */
+		if (!src->is_end_of_key &&
+		    vy_stmt_lsn(src->tuple) <= merge_until_lsn) {
+			vy_write_iterator_add_read_view_stmt(stream);
+			curr_rv_i++;
+			curr_rv_lsn = merge_until_lsn;
+			merge_until_lsn = vy_get_read_view_lsn(stream,
+							       curr_rv_i + 1);
+			vy_write_iterator_set_tuple(stream, src->tuple,
+						    src->is_tuple_refable);
+			goto next_step;
+		}
+
+		/* Squash upserts. */
 		if (vy_stmt_type(stream->tuple) == IPROTO_UPSERT &&
 		    (!src->is_end_of_key || stream->is_last_level)) {
 			const struct tuple *apply_to =
@@ -449,12 +633,29 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream)
 				break;
 			}
 			vy_write_iterator_set_tuple(stream, applied, true);
+			if (end_of_key_src.is_tuple_refable)
+				tuple_unref(end_of_key_src.tuple);
 			/* refresh tuple in virtual source */
 			end_of_key_src.tuple = stream->tuple;
+			end_of_key_src.is_tuple_refable = true;
+			tuple_ref(end_of_key_src.tuple);
 		}
 
-		if (src->is_end_of_key)
+next_step:
+		if (src->is_end_of_key) {
+			/*
+			 * ----- Part of the optimization 1 ------
+			 * Last level DELETE can appear here, if
+			 * it is the oldest statement of this key,
+			 * but pinned by a read view. Then we also
+			 * can skip it. DELETE of the key is the
+			 * same as its absence.
+			 */
+			if (vy_stmt_type(stream->tuple) != IPROTO_DELETE ||
+			    !stream->is_last_level)
+				vy_write_iterator_add_read_view_stmt(stream);
 			break;
+		}
 
 		rc = vy_write_iterator_merge_step(stream);
 		if (rc != 0)
@@ -462,6 +663,8 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream)
 	}
 
 	src_heap_delete(&stream->src_heap, &end_of_key_src.heap_node);
+	if (end_of_key_src.is_tuple_refable)
+		tuple_unref(end_of_key_src.tuple);
 	return rc;
 }
 
@@ -481,10 +684,16 @@ vy_write_iterator_next(struct vy_stmt_stream *vstream,
 	assert(vstream->iface->next == vy_write_iterator_next);
 	struct vy_write_iterator *stream = (struct vy_write_iterator *)vstream;
 	/*
-	 * Nullify the result stmt. If the next stmt is not
-	 * found, this would be a marker of the end of the stream.
+	 * Try to get the next statement from the current key
+	 * read view statements sequence.
 	 */
-	*ret = NULL;
+	*ret = vy_write_iterator_pop_read_view_stmt(stream);
+	if (*ret != NULL)
+		return 0;
+
+	/* Build the next key sequence. */
+	stream->stmt_i = 0;
+	stream->stmt_count = 0;
 
 	while (true) {
 		struct heap_node *node = src_heap_top(&stream->src_heap);
@@ -492,7 +701,8 @@ vy_write_iterator_next(struct vy_stmt_stream *vstream,
 			return 0; /* no more data */
 		struct vy_write_src *src =
 			container_of(node, struct vy_write_src, heap_node);
-		assert(src->tuple != NULL); /* Is search started? */
+		/* Search must be started in the task. */
+		assert(src->tuple != NULL);
 		vy_write_iterator_set_tuple(stream, src->tuple,
 					    src->is_tuple_refable);
 
@@ -500,36 +710,23 @@ vy_write_iterator_next(struct vy_stmt_stream *vstream,
 		if (rc != 0)
 			return -1;
 
-		if (vy_stmt_lsn(stream->tuple) > stream->oldest_vlsn)
-			break; /* Save the current stmt as the result. */
-
-		if (vy_stmt_type(stream->tuple) == IPROTO_REPLACE ||
-		    vy_stmt_type(stream->tuple) == IPROTO_DELETE) {
-			/*
-			 * If the tuple has extra size - it has
-			 * column mask of an update operation.
-			 * The tuples from secondary indexes
-			 * which don't modify its keys can be
-			 * skipped during dump,
-			 * @sa vy_can_skip_update().
-			 */
-			if (!stream->is_primary &&
-			    vy_can_skip_update(stream->key_def->column_mask,
-					       vy_stmt_column_mask(stream->tuple)))
-				continue;
-		}
-
 		/* Squash upserts and/or go to the next key */
 		rc = vy_write_iterator_next_key(stream);
 		if (rc != 0)
 			return -1;
-
-		if (vy_stmt_type(stream->tuple) == IPROTO_DELETE &&
-		    stream->is_last_level)
-			continue; /* Skip unnecessary DELETE */
-		break;
+		/*
+		 * Next_key() routine could skip the next key, for
+		 * example, if it was truncated by last level
+		 * DELETE or it consisted only from optimized
+		 * updates. Then try get the next key.
+		 */
+		if (stream->stmt_count != 0 || stream->src_heap.size == 0)
+			break;
 	}
-	*ret = stream->tuple;
+	/*
+	 * Again try to get the statement, after calling next_key.
+	 */
+	*ret = vy_write_iterator_pop_read_view_stmt(stream);
 	return 0;
 }
 
