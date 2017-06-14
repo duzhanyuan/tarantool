@@ -45,6 +45,7 @@ extern "C" {
 
 #include "yaml.h"
 #include "b64.h"
+#include "utf8.h"
 } /* extern "C" */
 #include "lua/utils.h"
 
@@ -447,70 +448,6 @@ static int dump_array(struct lua_yaml_dumper *dumper, struct luaL_field *field){
    return 1;
 }
 
-
-#define IS_PRINTABLE(string)                                               \
-    ((pointer[0] == 0x0A)         /* . == #x0A */                 \
-     || (pointer[0] >= 0x20       /* #x20 <= . <= #x7E */         \
-         && pointer[0] <= 0x7E)                                   \
-     || (pointer[0] == 0xC2       /* #0xA0 <= . <= #xD7FF */      \
-         && width > 0 && pointer[1] >= 0xA0)                      \
-     || (pointer[0] > 0xC2                                        \
-         && pointer[0] < 0xED)                                    \
-     || (pointer[0] == 0xED && width > 0                          \
-         && pointer[1] < 0xA0)                                    \
-     || (pointer[0] == 0xEE)                                      \
-     || (pointer[0] == 0xEF      /* #xE000 <= . <= #xFFFD */      \
-         && !(pointer[1] == 0xBB        /* && . != #xFEFF */      \
-         && width > 1 && pointer[2] == 0xBF)                      \
-         && !(width > 0 && pointer[1] == 0xBF                     \
-             && width > 1 && (pointer[2] == 0xBE                  \
-                 || pointer[2] == 0xBF))))
-
-
-/* Stolen from libyaml */
-static int
-yaml_check_utf8(const yaml_char_t *start, size_t length)
-{
-    const yaml_char_t *end = start+length;
-    const yaml_char_t *pointer = start;
-
-    while (pointer < end) {
-        unsigned char octet;
-        unsigned int width;
-        unsigned int value;
-        size_t k;
-
-        octet = pointer[0];
-        width = (octet & 0x80) == 0x00 ? 1 :
-                (octet & 0xE0) == 0xC0 ? 2 :
-                (octet & 0xF0) == 0xE0 ? 3 :
-                (octet & 0xF8) == 0xF0 ? 4 : 0;
-        value = (octet & 0x80) == 0x00 ? octet & 0x7F :
-                (octet & 0xE0) == 0xC0 ? octet & 0x1F :
-                (octet & 0xF0) == 0xE0 ? octet & 0x0F :
-                (octet & 0xF8) == 0xF0 ? octet & 0x07 : 0;
-        if (!width) return 0;
-        if (pointer+width > end) return 0;
-        for (k = 1; k < width; k ++) {
-            octet = pointer[k];
-            if ((octet & 0xC0) != 0x80) return 0;
-            value = (value << 6) + (octet & 0x3F);
-        }
-        if (!((width == 1) ||
-            (width == 2 && value >= 0x80) ||
-            (width == 3 && value >= 0x800) ||
-            (width == 4 && value >= 0x10000))) return 0;
-
-        /* gh-354: yaml incorrectly escapes special characters in a string */
-        if (*pointer > 0x7F && !IS_PRINTABLE(pointer))
-           return 0;
-
-        pointer += width;
-    }
-
-    return 1;
-}
-
 static int yaml_is_flow_mode(struct lua_yaml_dumper *dumper) {
    /*
     * Tarantool-specific: always quote strings in FLOW SEQUENCE
@@ -587,7 +524,7 @@ static int dump_node(struct lua_yaml_dumper *dumper)
          break;
       }
       style = YAML_ANY_SCALAR_STYLE; // analyze_string(dumper, str, len, &is_binary);
-      if (yaml_check_utf8((const yaml_char_t *) str, len)) {
+      if (check_utf8((const unsigned char *) str, len)) {
          if (yaml_is_flow_mode(dumper)) {
             style = YAML_SINGLE_QUOTED_SCALAR_STYLE;
          } else if (strstr(str, "\n\n") != NULL) {
