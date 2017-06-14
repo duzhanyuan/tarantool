@@ -45,8 +45,6 @@ extern "C" {
 
 #include "yaml.h"
 #include "b64.h"
-/* Use private header from bundled libyaml for IS_PRINTABLE() macro */
-#include "third_party/libyaml/src/yaml_private.h"
 } /* extern "C" */
 #include "lua/utils.h"
 
@@ -449,6 +447,26 @@ static int dump_array(struct lua_yaml_dumper *dumper, struct luaL_field *field){
    return 1;
 }
 
+
+#define IS_PRINTABLE(string)                                               \
+    ((pointer[0] == 0x0A)         /* . == #x0A */                 \
+     || (pointer[0] >= 0x20       /* #x20 <= . <= #x7E */         \
+         && pointer[0] <= 0x7E)                                   \
+     || (pointer[0] == 0xC2       /* #0xA0 <= . <= #xD7FF */      \
+         && width > 0 && pointer[1] >= 0xA0)                      \
+     || (pointer[0] > 0xC2                                        \
+         && pointer[0] < 0xED)                                    \
+     || (pointer[0] == 0xED && width > 0                          \
+         && pointer[1] < 0xA0)                                    \
+     || (pointer[0] == 0xEE)                                      \
+     || (pointer[0] == 0xEF      /* #xE000 <= . <= #xFFFD */      \
+         && !(pointer[1] == 0xBB        /* && . != #xFEFF */      \
+         && width > 1 && pointer[2] == 0xBF)                      \
+         && !(width > 0 && pointer[1] == 0xBF                     \
+             && width > 1 && (pointer[2] == 0xBE                  \
+                 || pointer[2] == 0xBF))))
+
+
 /* Stolen from libyaml */
 static int
 yaml_check_utf8(const yaml_char_t *start, size_t length)
@@ -484,8 +502,7 @@ yaml_check_utf8(const yaml_char_t *start, size_t length)
             (width == 4 && value >= 0x10000))) return 0;
 
         /* gh-354: yaml incorrectly escapes special characters in a string */
-        yaml_string_t ys; ys.pointer = (yaml_char_t *)pointer;
-        if (*pointer > 0x7F && !IS_PRINTABLE(ys))
+        if (*pointer > 0x7F && !IS_PRINTABLE(pointer))
            return 0;
 
         pointer += width;
