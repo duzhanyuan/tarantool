@@ -146,6 +146,16 @@ const char *
 box_tuple_field(const box_tuple_t *tuple, uint32_t fieldno);
 
 /**
+ * Convert tuple to yaml string
+ *
+ * \param tuple tuple
+ * \retval NULL in case of error written in diag
+ * \retval pointer to string allocated on fiber()->gc region
+ */
+char *
+box_tuple_to_string(const box_tuple_t *tuple);
+
+/**
  * Tuple iterator
  */
 typedef struct tuple_iterator box_tuple_iterator_t;
@@ -709,6 +719,9 @@ tuple_to_obuf(struct tuple *tuple, struct obuf *buf);
  */
 ssize_t
 tuple_to_buf(const struct tuple *tuple, char *buf, size_t size);
+
+char *
+tuple_to_yaml(const struct tuple *tuple);
 
 #if defined(__cplusplus)
 } /* extern "C" */

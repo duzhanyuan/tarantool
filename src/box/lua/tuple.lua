@@ -67,6 +67,9 @@ box_tuple_update(box_tuple_t *tuple, const char *expr, const char *expr_end);
 
 box_tuple_t *
 box_tuple_upsert(box_tuple_t *tuple, const char *expr, const char *expr_end);
+
+char *
+box_tuple_to_string(box_tuple_t *tuple);
 ]]
 
 local builtin = ffi.C
@@ -310,9 +313,7 @@ ffi.metatype(tuple_t, {
         return builtin.box_tuple_field_count(tuple)
     end;
     __tostring = function(tuple)
-        -- Unpack tuple, call yaml.encode, remove yaml header and footer
-        -- 5 = '---\n\n' (header), -6 = '\n...\n' (footer)
-        return yaml.encode(methods.totable(tuple)):sub(5, -6)
+        return ffi.string(builtin.box_tuple_to_string(tuple)):sub(5, -6)
     end;
     __index = function(tuple, key)
         if type(key) == "number" then

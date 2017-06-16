@@ -372,6 +372,13 @@ box_tuple_to_buf(const box_tuple_t *tuple, char *buf, size_t size)
 	return tuple_to_buf(tuple, buf, size);
 }
 
+char *
+box_tuple_to_string(const box_tuple_t *tuple)
+{
+	assert(tuple != NULL);
+	return tuple_to_yaml(tuple);
+}
+
 box_tuple_format_t *
 box_tuple_format(const box_tuple_t *tuple)
 {
